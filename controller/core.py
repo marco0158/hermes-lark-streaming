@@ -69,6 +69,27 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         with self._sessions_lock:
             self._sessions[key] = session
 
+    def _sess_put_if_absent(self, key: str, session: CardSession) -> CardSession:
+        """Atomically store session under ``key`` if not already present.
+
+        Returns the session that is actually stored under ``key`` after the call:
+        the newly-passed ``session`` if this call won the race, or the existing
+        one if another thread beat us to it.  Callers should use the return
+        value (not the passed-in session) to ensure all threads work on the
+        same shared session instance.
+
+        This fixes the v1.7.0 duplicate-card race where two near-simultaneous
+        ``on_message_started`` calls (e.g. from concurrent gateway hooks) both
+        passed ``_sess_get() is None`` and then both called ``_sess_put``,
+        creating two CardSessions and two Feishu cards for one message.
+        """
+        with self._sessions_lock:
+            existing = self._sessions.get(key)
+            if existing is not None:
+                return existing
+            self._sessions[key] = session
+            return session
+
     def _sess_pop(self, key: str) -> CardSession | None:
         """Thread-safe session removal (returns the removed session or None)."""
         with self._sessions_lock:
@@ -356,24 +377,31 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
 
         # v1.3.4 fix (P0): concurrency seal 可能已通过 on_interrupted 创建了
         # v1.3.5 fix: on_interrupted 中 fire-and-forget 的 _do_create_linear_card
-        existing = self._sess_get(message_id)
-        if existing is not None:
+        # v1.7.1 fix: 用 _sess_put_if_absent 把"检查 None + 创建 + 存"做成原子操作。
+        #   此前两个并发 on_message_started 都通过 _sess_get is None 检查后，
+        #   会各自创建一个 CardSession 并 _sess_put 覆盖 → 同一条消息产生两张卡片
+        #   （一张空白的"加载中"占位卡 + 一张真正的流式卡），日志表现为
+        #   连续两行 "HLS: session created msg=..."。
+        new_session = CardSession(message_id, chat_id, loop)
+        session = self._sess_put_if_absent(message_id, new_session)
+        if session is not new_session:
+            # 另一个线程先创建了 session（同一条消息的并发触发）。
+            # 复用它，丢弃我们刚 new 出来的对象，不再发新卡片。
             _logger.info(
-                "HLS: session already created by concurrency seal, reusing msg=%s trace=%s",
-                (message_id or "?")[:12], existing.card_trace_id,
+                "HLS: session already created by concurrent caller, reusing msg=%s trace=%s",
+                (message_id or "?")[:12], session.card_trace_id,
             )
-            if not existing._card_ready.is_set():
-                self._fire_and_forget(self._do_create_linear_card(existing), loop)
+            if not session._card_ready.is_set():
+                self._fire_and_forget(self._do_create_linear_card(session), loop)
             try:
                 from ..aowen import record_card_created, set_active_sessions
                 record_card_created()
                 set_active_sessions(self._sess_active_count())
             except Exception:
-                _logger.debug('metrics: record_card_created failed (reuse path)', exc_info=True)
+                _logger.debug('metrics: record_card_created failed (concurrent reuse path)', exc_info=True)
             return
 
-        session = CardSession(message_id, chat_id, loop)
-        self._sess_put(message_id, session)
+        # 我们赢了 race，session 已存入 _sessions[message_id]
         if anchor_id and anchor_id != message_id:
             session.anchor_id = anchor_id
             self._sess_put(anchor_id, session)
